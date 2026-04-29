@@ -1,79 +1,49 @@
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-
 export const config = {
-  api: { bodyParser: false },
-  supportsResponseStreaming: true,
-  maxDuration: 60,
+  // استفاده از Edge Runtime برای سرعت بالاتر و رفع خطای res.end
+  runtime: "edge", 
 };
 
+// دریافت آدرس مقصد از متغیرهای محیطی Netlify
 const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
-const STRIP_HEADERS = new Set([
-  "host",
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-  "forwarded",
-  "x-forwarded-host",
-  "x-forwarded-proto",
-  "x-forwarded-port",
-]);
-
-export default async function handler(req, res) {
+export default async function handler(request) {
+  // بررسی تنظیم بودن دامنه مقصد
   if (!TARGET_BASE) {
-    res.statusCode = 500;
-    return res.end("Misconfigured: TARGET_DOMAIN is not set");
+    return new Response("Error: TARGET_DOMAIN is not set in Environment Variables.", { status: 500 });
   }
 
   try {
-    const targetUrl = TARGET_BASE + req.url;
+    const url = new URL(request.url);
+    // ساخت آدرس کامل مقصد با حفظ مسیر (Path) و پارامترها (Query)
+    const targetUrl = TARGET_BASE + url.pathname + url.search;
 
-    const headers = {};
-    let clientIp = null;
-    for (const key of Object.keys(req.headers)) {
-      const k = key.toLowerCase();
-      const v = req.headers[key];
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip") { clientIp = v; continue; }
-      if (k === "x-forwarded-for") { if (!clientIp) clientIp = v; continue; }
-      headers[k] = Array.isArray(v) ? v.join(", ") : v;
-    }
-    if (clientIp) headers["x-forwarded-for"] = clientIp;
+    // کپی و فیلتر کردن هدرها برای جلوگیری از شناسایی و تداخل
+    const newHeaders = new Headers(request.headers);
+    newHeaders.delete("host");
+    newHeaders.delete("connection");
+    newHeaders.delete("x-nf-client-connection-ip"); // هدر مخصوص نیتلیفای
 
-    const method = req.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
+    const fetchOptions = {
+      method: request.method,
+      headers: newHeaders,
+      redirect: "manual",
+    };
 
-    const fetchOpts = { method, headers, redirect: "manual" };
-    if (hasBody) {
-      fetchOpts.body = Readable.toWeb(req);
-      fetchOpts.duplex = "half";
-    }
-
-    const upstream = await fetch(targetUrl, fetchOpts);
-
-    res.statusCode = upstream.status;
-    for (const [k, v] of upstream.headers) {
-      if (k.toLowerCase() === "transfer-encoding") continue;
-      try { res.setHeader(k, v); } catch {}
+    // انتقال بدنه درخواست برای متدهایی مثل POST
+    if (!["GET", "HEAD"].includes(request.method)) {
+      fetchOptions.body = request.body;
+      // برای پشتیبانی از استریمینگ در Fetch
+      fetchOptions.duplex = "half"; 
     }
 
-    if (upstream.body) {
-      await pipeline(Readable.fromWeb(upstream.body), res);
-    } else {
-      res.end();
-    }
-  } catch (err) {
-    console.error("relay error:", err);
-    if (!res.headersSent) {
-      res.statusCode = 502;
-      res.end("Bad Gateway: Tunnel Failed");
-    }
+    // ارسال درخواست به سرور مقصد
+    const response = await fetch(targetUrl, fetchOptions);
+
+    // برگرداندن پاسخ مستقیم به کاربر (Netlify خودش استریمینگ را مدیریت می‌کند)
+    return response;
+
+  } catch (error) {
+    console.error("Proxy Error:", error);
+    return new Response("Bad Gateway: Connection Failed", { status: 502 });
   }
 }
